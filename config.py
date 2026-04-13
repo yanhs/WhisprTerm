@@ -1,0 +1,9 @@
+TTYD_URL = "wss://ianprog.com/agents/ws"
+HOTKEY = "ctrl+cmd"  # Ctrl+Win (push-to-talk)
+WHISPER_MODEL = "large-v3"
+WHISPER_DEVICE = "cuda"
+WHISPER_COMPUTE = "float16"
+LANGUAGE = None  # Auto-detect (ru + en)
+SEND_ENTER = False
+SAMPLE_RATE = 16000
+AVAILABLE_MODELS = ["tiny", "base", "small", "medium", "large-v3"]

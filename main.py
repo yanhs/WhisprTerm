@@ -148,8 +148,10 @@ class WhisprTerm:
         self.model_ready = False
         self.tray = None
         self._rec_start_time = 0
+        self._rec_buf = None
         self._keys_down = set()
         self._hook_proc_ref = None  # prevent GC
+        self._block_next_win_up = False  # block Win release after recording
 
     def _load_worker_bg(self):
         from transcribe_worker import TranscribeWorker
@@ -166,32 +168,51 @@ class WhisprTerm:
         if not self.model_ready or self.recording:
             return
         self.recording = True
-        self._rec_start_time = time.time()
+        self._rec_start_time = time.monotonic()
+        # Start recording IMMEDIATELY in main process (C-thread, no GIL delay)
+        import sounddevice as sd
+        self._rec_buf = sd.rec(
+            frames=config.SAMPLE_RATE * 120,
+            samplerate=config.SAMPLE_RATE,
+            channels=1, dtype="float32", blocking=False,
+        )
         if self.tray:
             self.tray.icon = ICON_RECORDING
             self.tray.title = "Whispr Term — RECORDING"
-        self.worker.start_recording()
         print("[REC] Recording...")
 
     def _stop_recording(self):
         if not self.recording:
             return
-        elapsed = time.time() - self._rec_start_time
+        elapsed = time.monotonic() - self._rec_start_time
         if elapsed < 0.2:
             return
         self.recording = False
-        self.worker.stop_recording()
+        import sounddevice as sd
+        sd.stop()
+        # Get recorded audio
+        pos = min(int(elapsed * config.SAMPLE_RATE), len(self._rec_buf))
+        audio = self._rec_buf[:pos, 0].copy() if pos > 0 else np.array([], dtype="float32")
+        self._rec_buf = None
         if self.tray:
             self.tray.icon = ICON_PROCESSING
             self.tray.title = "Whispr Term — processing..."
-        print(f"[STOP] {elapsed:.1f}s")
+        print(f"[STOP] {elapsed:.1f}s ({pos} samples)")
 
-        def _wait_result():
+        def _transcribe():
+            if len(audio) < config.SAMPLE_RATE * 0.3:
+                print("[SKIP] Too short")
+                if self.tray:
+                    self.tray.icon = ICON_READY
+                    self.tray.title = "Whispr Term — ready"
+                return
+            # Send audio to worker for transcription
+            self.worker.transcribe_audio(audio)
             result = self.worker.get_result(timeout=30)
             if result:
                 rtype, old_text, new_text = result
                 if rtype == "final" and new_text:
-                    time.sleep(0.2)
+                    time.sleep(0.15)
                     _release_all_modifiers()
                     time.sleep(0.1)
                     _send_text_to_window(new_text)
@@ -206,7 +227,7 @@ class WhisprTerm:
                 self.tray.icon = ICON_READY
                 self.tray.title = "Whispr Term — ready"
 
-        threading.Thread(target=_wait_result, daemon=True).start()
+        threading.Thread(target=_transcribe, daemon=True).start()
 
     def setup_hotkey(self):
         """LL keyboard hook: Ctrl+Win = record, blocks Win to prevent Start menu."""
@@ -227,27 +248,32 @@ class WhisprTerm:
                 ctrl = VK_LCONTROL in app._keys_down or VK_RCONTROL in app._keys_down
                 win = _VK_LWIN in app._keys_down or _VK_RWIN in app._keys_down
 
-                # Win key events
+                # Win key events — ALWAYS block when Ctrl involved
                 if vk in (_VK_LWIN, _VK_RWIN):
                     if is_down and ctrl:
-                        # Ctrl already held + Win pressed = START RECORDING
                         app._start_recording()
-                        return 1  # block Win
-                    elif is_up and app.recording:
-                        # Win released while recording = STOP
-                        app._stop_recording()
-                        return 1  # block Win release (prevent Start menu)
+                        app._block_next_win_up = True
+                        return 1
+                    elif is_up:
+                        if app.recording:
+                            app._stop_recording()
+                            app._block_next_win_up = False
+                            return 1
+                        elif app._block_next_win_up:
+                            app._block_next_win_up = False
+                            return 1  # block delayed Win release after Ctrl stopped recording
+                        elif ctrl:
+                            return 1
                     elif ctrl:
-                        return 1  # block Win while Ctrl held
+                        return 1
 
                 # Ctrl key events
                 if vk in (VK_LCONTROL, VK_RCONTROL):
                     if is_down and win:
-                        # Win already held + Ctrl pressed = START RECORDING
                         app._start_recording()
-                        return 0  # don't block Ctrl
+                        app._block_next_win_up = True
+                        return 0
                     elif is_up and app.recording:
-                        # Ctrl released while recording = STOP
                         app._stop_recording()
                         return 0
 

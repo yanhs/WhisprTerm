@@ -152,6 +152,9 @@ class WhisprTerm:
         self._keys_down = set()
         self._hook_proc_ref = None  # prevent GC
         self._block_next_win_up = False  # block Win release after recording
+        self._hook_handle = 0  # current installed hook
+        self._pending_start = threading.Event()
+        self._pending_stop = threading.Event()
 
     def _load_worker_bg(self):
         from transcribe_worker import TranscribeWorker
@@ -207,8 +210,33 @@ class WhisprTerm:
                     self.tray.title = "Whispr Term — ready"
                 return
             # Send audio to worker for transcription
-            self.worker.transcribe_audio(audio)
-            result = self.worker.get_result(timeout=30)
+            try:
+                self.worker.transcribe_audio(audio)
+                result = self.worker.get_result(timeout=20)
+            except Exception as e:
+                print(f"[ERR] worker comm failed: {e}")
+                result = None
+
+            if result is None:
+                # Worker hung/died (e.g. CUDA context lost after sleep) — restart it
+                print("[WARN] No result — restarting worker...")
+                if self.tray:
+                    self.tray.title = "Whispr Term — restarting engine..."
+                try:
+                    self.worker.stop()
+                except Exception:
+                    pass
+                try:
+                    from transcribe_worker import TranscribeWorker
+                    self.worker = TranscribeWorker(self.model_name, self.device)
+                    self.worker.start()
+                    print("[OK] Worker restarted — retrying...")
+                    self.worker.transcribe_audio(audio)
+                    result = self.worker.get_result(timeout=30)
+                except Exception as e:
+                    print(f"[ERR] worker restart failed: {e}")
+                    result = None
+
             if result:
                 rtype, old_text, new_text = result
                 if rtype == "final" and new_text:
@@ -222,16 +250,31 @@ class WhisprTerm:
                 else:
                     print("[SKIP] No speech")
             else:
-                print("[ERR] No result")
+                print("[ERR] No result after restart")
             if self.tray:
                 self.tray.icon = ICON_READY
                 self.tray.title = "Whispr Term — ready"
 
         threading.Thread(target=_transcribe, daemon=True).start()
 
+    def _recording_worker(self):
+        """Dedicated thread: does heavy sd.rec()/sd.stop() work off the hook thread.
+        The hook callback must stay fast or Windows kills the hook (LowLevelHooksTimeout)."""
+        while True:
+            if self._pending_start.wait(timeout=0.5):
+                self._pending_start.clear()
+                self._start_recording()
+            if self._pending_stop.is_set():
+                self._pending_stop.clear()
+                self._stop_recording()
+
     def setup_hotkey(self):
-        """LL keyboard hook: Ctrl+Win = record, blocks Win to prevent Start menu."""
+        """LL keyboard hook: Ctrl+Win = record. Hook callback only sets flags
+        (stays fast). A watchdog re-installs the hook if Windows drops it (sleep/wake)."""
         app = self
+
+        # Heavy-work thread — keeps sd.rec() off the hook callback
+        threading.Thread(target=self._recording_worker, daemon=True).start()
 
         @HOOKPROC
         def hook_proc(nCode, wParam, lParam):
@@ -251,17 +294,17 @@ class WhisprTerm:
                 # Win key events — ALWAYS block when Ctrl involved
                 if vk in (_VK_LWIN, _VK_RWIN):
                     if is_down and ctrl:
-                        app._start_recording()
+                        app._pending_start.set()
                         app._block_next_win_up = True
                         return 1
                     elif is_up:
-                        if app.recording:
-                            app._stop_recording()
+                        if app.recording or app._pending_start.is_set():
+                            app._pending_stop.set()
                             app._block_next_win_up = False
                             return 1
                         elif app._block_next_win_up:
                             app._block_next_win_up = False
-                            return 1  # block delayed Win release after Ctrl stopped recording
+                            return 1
                         elif ctrl:
                             return 1
                     elif ctrl:
@@ -270,11 +313,11 @@ class WhisprTerm:
                 # Ctrl key events
                 if vk in (VK_LCONTROL, VK_RCONTROL):
                     if is_down and win:
-                        app._start_recording()
+                        app._pending_start.set()
                         app._block_next_win_up = True
                         return 0
-                    elif is_up and app.recording:
-                        app._stop_recording()
+                    elif is_up and (app.recording or app._pending_start.is_set()):
+                        app._pending_stop.set()
                         return 0
 
             return _user32.CallNextHookEx(0, nCode, wParam, lParam)
@@ -282,21 +325,37 @@ class WhisprTerm:
         self._hook_proc_ref = hook_proc
 
         def _hook_thread():
-            hook = _user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, 0, 0)
-            if not hook:
+            # LL hooks require the message pump on the SAME thread that installed
+            # them. So install AND re-install here, with a non-blocking pump.
+            PM_REMOVE = 1
+            self._hook_handle = _user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, 0, 0)
+            if not self._hook_handle:
                 print(f"  [ERR] Hook failed: {ctypes.GetLastError()}")
-                # Fallback to polling
                 self._fallback_polling()
                 return
-            print(f"  Hook OK: {hook}")
+            print(f"  Hook OK: {self._hook_handle}")
+
             msg = wintypes.MSG()
-            while _user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
-                _user32.TranslateMessage(ctypes.byref(msg))
-                _user32.DispatchMessageW(ctypes.byref(msg))
-            _user32.UnhookWindowsHookEx(hook)
+            last_reinstall = time.monotonic()
+            while True:
+                while _user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
+                    _user32.TranslateMessage(ctypes.byref(msg))
+                    _user32.DispatchMessageW(ctypes.byref(msg))
+                # Watchdog: re-install hook every 4s. If Windows dropped it after
+                # sleep/wake or a slow callback, this restores it within 4s.
+                now = time.monotonic()
+                if now - last_reinstall >= 4:
+                    last_reinstall = now
+                    new = _user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, 0, 0)
+                    if new:
+                        old = self._hook_handle
+                        self._hook_handle = new
+                        if old:
+                            _user32.UnhookWindowsHookEx(old)
+                time.sleep(0.005)
 
         threading.Thread(target=_hook_thread, daemon=True).start()
-        print("  Hotkey: Ctrl+Win (LL hook, instant, no Start menu)")
+        print("  Hotkey: Ctrl+Win (LL hook + watchdog, survives sleep/wake)")
 
     def _fallback_polling(self):
         """Fallback if LL hook fails — polling based."""

@@ -125,6 +125,7 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
+WM_REINSTALL_HOOK = 0x0400 + 100  # custom WM_USER message for watchdog
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
 
@@ -325,9 +326,10 @@ class WhisprTerm:
         self._hook_proc_ref = hook_proc
 
         def _hook_thread():
-            # LL hooks require the message pump on the SAME thread that installed
-            # them. So install AND re-install here, with a non-blocking pump.
-            PM_REMOVE = 1
+            # LL hook requires a BLOCKING GetMessage pump on the installing thread
+            # — the callback only fires while the thread is waiting for messages.
+            kernel32 = ctypes.windll.kernel32
+            thread_id = kernel32.GetCurrentThreadId()
             self._hook_handle = _user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, 0, 0)
             if not self._hook_handle:
                 print(f"  [ERR] Hook failed: {ctypes.GetLastError()}")
@@ -335,24 +337,27 @@ class WhisprTerm:
                 return
             print(f"  Hook OK: {self._hook_handle}")
 
+            # Watchdog: every 4s post a message that triggers a hook re-install.
+            # Posting wakes the blocking GetMessage loop without breaking it.
+            def _watchdog():
+                while True:
+                    time.sleep(4)
+                    _user32.PostThreadMessageW(thread_id, WM_REINSTALL_HOOK, 0, 0)
+            threading.Thread(target=_watchdog, daemon=True).start()
+
             msg = wintypes.MSG()
-            last_reinstall = time.monotonic()
-            while True:
-                while _user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
-                    _user32.TranslateMessage(ctypes.byref(msg))
-                    _user32.DispatchMessageW(ctypes.byref(msg))
-                # Watchdog: re-install hook every 4s. If Windows dropped it after
-                # sleep/wake or a slow callback, this restores it within 4s.
-                now = time.monotonic()
-                if now - last_reinstall >= 4:
-                    last_reinstall = now
+            while _user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
+                if msg.message == WM_REINSTALL_HOOK:
+                    # Re-install hook — restores it if Windows dropped it (sleep/wake)
                     new = _user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, 0, 0)
                     if new:
                         old = self._hook_handle
                         self._hook_handle = new
                         if old:
                             _user32.UnhookWindowsHookEx(old)
-                time.sleep(0.005)
+                    continue
+                _user32.TranslateMessage(ctypes.byref(msg))
+                _user32.DispatchMessageW(ctypes.byref(msg))
 
         threading.Thread(target=_hook_thread, daemon=True).start()
         print("  Hotkey: Ctrl+Win (LL hook + watchdog, survives sleep/wake)")

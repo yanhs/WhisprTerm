@@ -188,12 +188,18 @@ class WhisprTerm:
     def _stop_recording(self):
         if not self.recording:
             return
-        elapsed = time.monotonic() - self._rec_start_time
-        if elapsed < 0.2:
-            return
+        # ALWAYS reset state first — a short tap must not leave recording=True,
+        # or _start_recording() would refuse every future press (dead hotkey).
         self.recording = False
+        elapsed = time.monotonic() - self._rec_start_time
         import sounddevice as sd
         sd.stop()
+        if elapsed < 0.2:
+            self._rec_buf = None
+            if self.tray:
+                self.tray.icon = ICON_READY
+                self.tray.title = "Whispr Term — ready"
+            return
         # Get recorded audio
         pos = min(int(elapsed * config.SAMPLE_RATE), len(self._rec_buf))
         audio = self._rec_buf[:pos, 0].copy() if pos > 0 else np.array([], dtype="float32")

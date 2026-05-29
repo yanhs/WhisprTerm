@@ -128,6 +128,8 @@ WM_SYSKEYUP = 0x0105
 WM_REINSTALL_HOOK = 0x0400 + 100  # custom WM_USER message for watchdog
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
+VK_LMENU = 0xA4   # left Alt
+VK_RMENU = 0xA5   # right Alt
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -152,7 +154,7 @@ class WhisprTerm:
         self._rec_buf = None
         self._keys_down = set()
         self._hook_proc_ref = None  # prevent GC
-        self._block_next_win_up = False  # block Win release after recording
+        self._block_next_alt_up = False  # block Alt release after recording
         self._hook_handle = 0  # current installed hook
         self._pending_start = threading.Event()
         self._pending_stop = threading.Event()
@@ -166,7 +168,7 @@ class WhisprTerm:
         if self.tray:
             self.tray.icon = ICON_READY
             self.tray.title = "Whispr Term — ready"
-        print("[OK] Ready! Hold Ctrl+Win and speak.")
+        print("[OK] Ready! Hold Ctrl+Alt and speak.")
 
     def _start_recording(self):
         if not self.model_ready or self.recording:
@@ -276,7 +278,7 @@ class WhisprTerm:
                 self._stop_recording()
 
     def setup_hotkey(self):
-        """LL keyboard hook: Ctrl+Win = record. Hook callback only sets flags
+        """LL keyboard hook: Ctrl+Alt = record. Hook callback only sets flags
         (stays fast). A watchdog re-installs the hook if Windows drops it (sleep/wake)."""
         app = self
 
@@ -296,21 +298,21 @@ class WhisprTerm:
                     app._keys_down.discard(vk)
 
                 ctrl = VK_LCONTROL in app._keys_down or VK_RCONTROL in app._keys_down
-                win = _VK_LWIN in app._keys_down or _VK_RWIN in app._keys_down
+                alt = VK_LMENU in app._keys_down or VK_RMENU in app._keys_down
 
-                # Win key events — ALWAYS block when Ctrl involved
-                if vk in (_VK_LWIN, _VK_RWIN):
+                # Alt key events — block when Ctrl involved (suppress menu activation)
+                if vk in (VK_LMENU, VK_RMENU):
                     if is_down and ctrl:
                         app._pending_start.set()
-                        app._block_next_win_up = True
+                        app._block_next_alt_up = True
                         return 1
                     elif is_up:
                         if app.recording or app._pending_start.is_set():
                             app._pending_stop.set()
-                            app._block_next_win_up = False
+                            app._block_next_alt_up = False
                             return 1
-                        elif app._block_next_win_up:
-                            app._block_next_win_up = False
+                        elif app._block_next_alt_up:
+                            app._block_next_alt_up = False
                             return 1
                         elif ctrl:
                             return 1
@@ -319,9 +321,9 @@ class WhisprTerm:
 
                 # Ctrl key events
                 if vk in (VK_LCONTROL, VK_RCONTROL):
-                    if is_down and win:
+                    if is_down and alt:
                         app._pending_start.set()
-                        app._block_next_win_up = True
+                        app._block_next_alt_up = True
                         return 0
                     elif is_up and (app.recording or app._pending_start.is_set()):
                         app._pending_stop.set()
@@ -366,7 +368,7 @@ class WhisprTerm:
                 _user32.DispatchMessageW(ctypes.byref(msg))
 
         threading.Thread(target=_hook_thread, daemon=True).start()
-        print("  Hotkey: Ctrl+Win (LL hook + watchdog, survives sleep/wake)")
+        print("  Hotkey: Ctrl+Alt (LL hook + watchdog, survives sleep/wake)")
 
     def _fallback_polling(self):
         """Fallback if LL hook fails — polling based."""
@@ -376,9 +378,9 @@ class WhisprTerm:
             while True:
                 ctrl = bool(_user32.GetAsyncKeyState(VK_LCONTROL) & 0x8000) or \
                        bool(_user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
-                win = bool(_user32.GetAsyncKeyState(_VK_LWIN) & 0x8000) or \
-                      bool(_user32.GetAsyncKeyState(_VK_RWIN) & 0x8000)
-                both = ctrl and win
+                alt = bool(_user32.GetAsyncKeyState(VK_LMENU) & 0x8000) or \
+                      bool(_user32.GetAsyncKeyState(VK_RMENU) & 0x8000)
+                both = ctrl and alt
                 if both and not was:
                     self._start_recording()
                 elif not both and was and self.recording:
@@ -391,7 +393,7 @@ class WhisprTerm:
         status = "ready" if self.model_ready else "loading..."
         return pystray.Menu(
             pystray.MenuItem(f"{status} | {self.model_name} ({self.device})", None, enabled=False),
-            pystray.MenuItem("Hotkey: Ctrl+Win (hold)", None, enabled=False),
+            pystray.MenuItem("Hotkey: Ctrl+Alt (hold)", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.quit_app),
         )

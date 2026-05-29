@@ -1,11 +1,11 @@
 # Whispr Term
 
 Voice-to-text for browser terminals (ttyd / xterm.js in Chrome).
-Push-to-talk: **hold `Ctrl+Win`, speak, release** — the transcription is pasted into the focused terminal.
+Push-to-talk: **hold `Ctrl+Alt`, speak, release** — the transcription is pasted into the focused terminal.
 
 ## Specs
 - Engine: `faster-whisper large-v3` on CUDA (float16), Russian + English auto-detect
-- Hotkey: `Ctrl+Win` held = record, release = transcribe + paste (`Ctrl+Shift+V`)
+- Hotkey: `Ctrl+Alt` held = record, release = transcribe + paste (`Ctrl+Shift+V`)
 - Survives sleep/wake (LL-hook watchdog) and worker crashes (auto-restart)
 - System tray icon (green = ready, red = recording, yellow = processing)
 
